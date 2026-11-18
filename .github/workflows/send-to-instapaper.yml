@@ -1,0 +1,64 @@
+name: Send new briefs to Instapaper
+
+on:
+  push:
+    branches: [main]
+    paths: ["briefs/**.html"]
+  workflow_dispatch:
+    inputs:
+      file:
+        description: "要重送的檔案，例如 briefs/2026-11-18.html"
+        required: true
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find new brief files
+        id: files
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            files="${{ github.event.inputs.file }}"
+          else
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              files=$(git diff-tree --no-commit-id --name-only --diff-filter=A -r HEAD -- 'briefs/*.html')
+            else
+              files=$(git diff --name-only --diff-filter=A "$before" HEAD -- 'briefs/*.html')
+            fi
+          fi
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$files" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "New files: $files"
+
+      - name: Wait for Pages and save to Instapaper
+        if: steps.files.outputs.files != ''
+        env:
+          IP_USER: ${{ secrets.INSTAPAPER_USERNAME }}
+          IP_PASS: ${{ secrets.INSTAPAPER_PASSWORD }}
+          FILES: ${{ steps.files.outputs.files }}
+        run: |
+          set -e
+          base="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          for f in $FILES; do
+            url="$base/$f"
+            echo "Waiting for $url"
+            ok=""
+            for i in $(seq 1 40); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' "$url?nocache=$i")
+              if [ "$code" = "200" ]; then ok=1; break; fi
+              sleep 15
+            done
+            [ -n "$ok" ] || { echo "Page never went live: $url"; exit 1; }
+            title=$(grep -o '<title>[^<]*' "$f" | head -1 | sed 's/<title>//')
+            status=$(curl -s -o /dev/null -w '%{http_code}' -u "$IP_USER:$IP_PASS" \
+              --data-urlencode "url=$url" --data-urlencode "title=$title" \
+              https://www.instapaper.com/api/add)
+            echo "Instapaper responded $status for $f"
+            [ "$status" = "201" ] || exit 1
+          done
